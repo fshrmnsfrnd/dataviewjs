@@ -1,11 +1,12 @@
 import type { QuartzTransformerPlugin } from "@quartz-community/types"
 import type { Parent } from "unist"
 import type { Root, Code, BlockContent, HTML } from "mdast"
+import type { VFile } from "vfile"
 import { visit } from "unist-util-visit"
 import { DOMParser } from "linkedom"
 
-// Deklariere require für TypeScript, falls Node-Types fehlen
-declare const require: any;
+// 1. Linter-konformes require (ohne any)
+declare const require: (id: string) => unknown;
 
 export interface DataviewJSOptions extends Record<string, unknown> {}
 
@@ -15,10 +16,10 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (_opts) =>
     markdownPlugins() {
       return [
         () => {
-          return async (tree: Root, file: any) => {
+          // 2. file als VFile typisiert (ohne any)
+          return async (tree: Root, file: VFile) => {
             const promises: Promise<void>[] = []
 
-            // Explizite Typen für index und parent hinzugefügt
             visit(tree, "code", (node: Code, index: number | undefined, parent: Parent | undefined) => {
               if (node.lang === "dataviewjs") {
                 promises.push(
@@ -41,21 +42,25 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (_opts) =>
                             children: [{ type: "text", value: String(text) }],
                           })
                         }
-                      }; // Semikolon hinzugefügt
+                      };
 
                       const mockRequire = (id: string) => {
                         if (id === "obsidian") {
                           return {
-                            requestUrl: async (args: any) => {
-                              const url = typeof args === "string" ? args : args.url
-                              const res = await fetch(url, args)
-                              const text = await res.text()
-                              return { text, status: res.status }
+                            // 3. args strikt typisiert für Obsidian's requestUrl (ohne any)
+                            requestUrl: async (args: string | { url: string; [key: string]: unknown }) => {
+                              const url = typeof args === "string" ? args : args.url;
+                              // Wir übergeben das Objekt sicher an die native fetch API weiter
+                              const fetchOpts = typeof args === "string" ? undefined : (args as RequestInit);
+                              
+                              const res = await fetch(url, fetchOpts);
+                              const text = await res.text();
+                              return { text, status: res.status };
                             },
                           }
                         }
                         return require(id)
-                      }; // Semikolon hinzugefügt
+                      };
 
                       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
                       const executor = new AsyncFunction("dv", "require", "DOMParser", node.value);
@@ -65,12 +70,13 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (_opts) =>
                         (parent as Parent).children.splice(index, 1, ...generatedNodes);
                       }
                     } catch (err) {
-                      console.error(`[DataviewJS] Error in file ${file.data?.slug}:`, err)
+                      const slug = file.data?.slug ?? "unknown";
+                      console.error(`[DataviewJS] Error in file ${String(slug)}:`, err)
                       if (parent && index !== undefined) {
                         const errorNode: HTML = {
                           type: "html",
-                          value: `<div class="dataviewjs-error" style="color: red; border: 1px solid red; padding: 10px;">DataviewJS Render Error: ${err}</div>`
-                        }; // Semikolon hinzugefügt (Hier entstand der Callable-Fehler!)
+                          value: `<div class="dataviewjs-error" style="color: red; border: 1px solid red; padding: 10px;">DataviewJS Render Error: ${String(err)}</div>`
+                        };
                         
                         (parent as Parent).children.splice(index, 1, errorNode);
                       }
