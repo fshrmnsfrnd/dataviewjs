@@ -1,37 +1,37 @@
 import type { QuartzTransformerPlugin } from "@quartz-community/types"
-import type { Node, Parent } from "unist"
+import type { Parent } from "unist"
+import type { Code, BlockContent, HTML } from "mdast"
 import { visit } from "unist-util-visit"
 import { DOMParser } from "linkedom"
 
-// Definiere (leere) Optionen, falls das Plugin später über die quartz.config.yaml konfigurierbar sein soll
-export interface DataviewJSOptions {
-  // z.B. timeoutMs?: number
-}
+// 1. Saubere Typisierung für (spätere) Optionen, die dem Constraint entspricht
+export interface DataviewJSOptions extends Record<string, unknown> {}
 
-// Factory Pattern (Astro-style)
-export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions | void> = (opts) => {
+export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (opts) => {
   return {
     name: "DataviewJS",
     markdownPlugins() {
-      // Remark/Unified Plugin als Return
       return [
         () => {
-          return async (tree: Parent, file) => {
+          return async (tree: Parent, file: any) => {
             const promises: Promise<void>[] = []
 
-            visit(tree, "code", (node: any, index, parent) => {
+            // 2. Den "node" strikt als 'Code' (aus mdast) typisieren
+            visit(tree, "code", (node: Code, index, parent) => {
               if (node.lang === "dataviewjs") {
                 promises.push(
                   (async () => {
                     try {
-                      const generatedNodes: Node[] = []
+                      // 3. Generierte Elemente strikt als 'BlockContent' typisieren
+                      const generatedNodes: BlockContent[] = []
 
-                      // Mock Obsidian 'dv' API
                       const dv = {
                         header: (level: number, text: string) => {
+                          // mdast erlaubt für depth strikt nur 1, 2, 3, 4, 5, 6
+                          const depth = Math.min(Math.max(level, 1), 6) as 1 | 2 | 3 | 4 | 5 | 6
                           generatedNodes.push({
                             type: "heading",
-                            depth: level,
+                            depth,
                             children: [{ type: "text", value: String(text) }],
                           })
                         },
@@ -43,13 +43,12 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions | void> = (op
                         }
                       }
 
-                      // Mock Obsidian 'requestUrl' API
                       const mockRequire = (id: string) => {
                         if (id === "obsidian") {
                           return {
                             requestUrl: async (args: any) => {
                               const url = typeof args === "string" ? args : args.url
-                              const res = await fetch(url, args) 
+                              const res = await fetch(url, args)
                               const text = await res.text()
                               return { text, status: res.status }
                             },
@@ -58,22 +57,23 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions | void> = (op
                         return require(id)
                       }
 
-                      // Async Ausführung in isoliertem Scope
                       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
                       const executor = new AsyncFunction("dv", "require", "DOMParser", node.value)
                       await executor(dv, mockRequire, DOMParser)
 
-                      // AST-Manipulation: Ersetze Dataview-Codeblock mit den neuen Nodes
+                      // 4. Austausch im Syntaxbaum
                       if (parent && index !== undefined) {
                         parent.children.splice(index, 1, ...generatedNodes)
                       }
                     } catch (err) {
                       console.error(`[DataviewJS] Error in file ${file.data?.slug}:`, err)
                       if (parent && index !== undefined) {
-                        parent.children.splice(index, 1, {
+                        // Fehlermeldung als sauberen HTML-Node übergeben
+                        const errorNode: HTML = {
                           type: "html",
-                          value: `<div class="dataviewjs-error">DataviewJS Render Error: ${err}</div>`
-                        })
+                          value: `<div class="dataviewjs-error" style="color: red; border: 1px solid red; padding: 10px;">DataviewJS Render Error: ${err}</div>`
+                        }
+                        parent.children.splice(index, 1, errorNode)
                       }
                     }
                   })()
@@ -81,7 +81,7 @@ export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions | void> = (op
               }
             })
 
-            // Warten bis alle asynchronen Dataview-Scripts in der Datei geparst wurden
+            // Warten, bis alle Blöcke gerendert sind
             await Promise.all(promises)
           }
         }
