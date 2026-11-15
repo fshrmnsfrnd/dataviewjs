@@ -1,109 +1,154 @@
+import { createRequire as createNodeRequire } from "node:module";
+import vm from "node:vm";
 import type { QuartzTransformerPlugin } from "@quartz-community/types";
-import type { Parent } from "unist";
-import type { Root, Code, BlockContent, HTML } from "mdast";
+import type { Code, Parent, Root, RootContent } from "mdast";
+import type { Processor } from "unified";
 import type { VFile } from "vfile";
 import { visit } from "unist-util-visit";
-import { DOMParser } from "linkedom";
+import { DOMParser as LinkedomDOMParser } from "linkedom";
+import { createDv, h, type MarkdownParser } from "./dv";
+import { createObsidianModule, OBSIDIAN_GLOBALS_SOURCE } from "./obsidian";
+import { styles } from "./styles";
 
-// 1. Linter-konformes require (ohne any)
-declare const require: (id: string) => unknown;
+export interface DataviewJSOptions {
+  /**
+   * Milliseconds after which a `requestUrl()` call made by a script is
+   * aborted, so a slow server cannot hang the build. `0` disables the limit.
+   */
+  requestTimeout?: number;
+}
 
-export interface DataviewJSOptions extends Record<string, unknown> {}
+const defaultOptions: Required<DataviewJSOptions> = {
+  requestTimeout: 15000,
+};
 
-export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (_opts) => {
+const nodeRequire = createNodeRequire(import.meta.url);
+
+/**
+ * linkedom only fills `document.body` when the markup has an `<html>` root,
+ * while a browser's DOMParser always creates one. Wrap fragments so scripts
+ * written against the browser behave the same.
+ */
+class DOMParser {
+  parseFromString(markup: string, mimeType: "text/html" | "image/svg+xml" | "text/xml") {
+    const wrapped =
+      mimeType === "text/html" && !/<html[\s>]/i.test(markup)
+        ? `<!DOCTYPE html><html><head></head><body>${markup}</body></html>`
+        : markup;
+    return new LinkedomDOMParser().parseFromString(wrapped, mimeType);
+  }
+}
+
+const stripPositions = (node: { position?: unknown; children?: unknown[] }): void => {
+  delete node.position;
+  for (const child of node.children ?? []) stripPositions(child as typeof node);
+};
+
+/**
+ * Dataview renders every string it is given as markdown. Reuse the processor
+ * Quartz is running, so the same syntax extensions apply to generated text.
+ */
+function createMarkdownParser(processor: Processor | undefined): MarkdownParser {
+  return (text) => {
+    if (text === "") return [];
+    try {
+      if (!processor) throw new Error("no processor");
+      const root = processor.parse(text) as Root;
+      stripPositions(root);
+      const only = root.children.length === 1 ? root.children[0] : undefined;
+      return only?.type === "paragraph" ? only.children : root.children;
+    } catch {
+      return [{ type: "text", value: text }];
+    }
+  };
+}
+
+async function runScript(
+  source: string,
+  filename: string,
+  parseMarkdown: MarkdownParser,
+  opts: Required<DataviewJSOptions>,
+): Promise<RootContent[]> {
+  const output: RootContent[] = [];
+  const dv = createDv(parseMarkdown, output);
+  const obsidian = createObsidianModule(opts.requestTimeout);
+
+  // A separate context gives the script its own String/Array prototypes, so
+  // Obsidian's prototype extensions never leak into the Quartz build process.
+  const context = vm.createContext({
+    dv,
+    dataview: dv,
+    require: (id: string) => (id === "obsidian" ? obsidian : nodeRequire(id)),
+    DOMParser,
+    console,
+    fetch,
+    Headers,
+    Request,
+    Response,
+    URL,
+    URLSearchParams,
+    AbortController,
+    AbortSignal,
+    TextDecoder,
+    TextEncoder,
+    structuredClone,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    atob,
+    btoa,
+  });
+  vm.runInContext(OBSIDIAN_GLOBALS_SOURCE, context);
+  await vm.runInContext(`(async () => {\n${source}\n})()`, context, {
+    filename,
+    lineOffset: -1,
+  });
+  return output;
+}
+
+export const DataviewJS: QuartzTransformerPlugin<DataviewJSOptions> = (userOpts) => {
+  const opts = { ...defaultOptions, ...userOpts };
   return {
     name: "DataviewJS",
     markdownPlugins() {
       return [
-        () => {
-          // 2. file als VFile typisiert (ohne any)
+        function (this: Processor | undefined) {
+          const parseMarkdown = createMarkdownParser(
+            typeof this?.parse === "function" ? this : undefined,
+          );
+
           return async (tree: Root, file: VFile) => {
-            const promises: Promise<void>[] = [];
+            const blocks: { node: Code; parent: Parent }[] = [];
+            visit(tree, "code", (node: Code, _index, parent: Parent | undefined) => {
+              if (node.lang === "dataviewjs" && parent) blocks.push({ node, parent });
+            });
 
-            visit(
-              tree,
-              "code",
-              (node: Code, index: number | undefined, parent: Parent | undefined) => {
-                if (node.lang === "dataviewjs") {
-                  promises.push(
-                    (async () => {
-                      try {
-                        const generatedNodes: BlockContent[] = [];
-
-                        const dv = {
-                          header: (level: number, text: string) => {
-                            const depth = Math.min(Math.max(level, 1), 6) as 1 | 2 | 3 | 4 | 5 | 6;
-                            generatedNodes.push({
-                              type: "heading",
-                              depth,
-                              children: [{ type: "text", value: String(text) }],
-                            });
-                          },
-                          paragraph: (text: string) => {
-                            generatedNodes.push({
-                              type: "paragraph",
-                              children: [{ type: "text", value: String(text) }],
-                            });
-                          },
-                        };
-
-                        const mockRequire = (id: string) => {
-                          if (id === "obsidian") {
-                            return {
-                              // 3. args strikt typisiert für Obsidian's requestUrl (ohne any)
-                              requestUrl: async (
-                                args: string | { url: string; [key: string]: unknown },
-                              ) => {
-                                const url = typeof args === "string" ? args : args.url;
-                                // Wir übergeben das Objekt sicher an die native fetch API weiter
-                                const fetchOpts =
-                                  typeof args === "string" ? undefined : (args as RequestInit);
-
-                                const res = await fetch(url, fetchOpts);
-                                const text = await res.text();
-                                return { text, status: res.status };
-                              },
-                            };
-                          }
-                          return require(id);
-                        };
-
-                        const AsyncFunction = Object.getPrototypeOf(
-                          async function () {},
-                        ).constructor;
-                        const executor = new AsyncFunction(
-                          "dv",
-                          "require",
-                          "DOMParser",
-                          node.value,
-                        );
-                        await executor(dv, mockRequire, DOMParser);
-
-                        if (parent && index !== undefined) {
-                          (parent as Parent).children.splice(index, 1, ...generatedNodes);
-                        }
-                      } catch (err) {
-                        const slug = file.data?.slug ?? "unknown";
-                        console.error(`[DataviewJS] Error in file ${String(slug)}:`, err);
-                        if (parent && index !== undefined) {
-                          const errorNode: HTML = {
-                            type: "html",
-                            value: `<div class="dataviewjs-error" style="color: red; border: 1px solid red; padding: 10px;">DataviewJS Render Error: ${String(err)}</div>`,
-                          };
-
-                          (parent as Parent).children.splice(index, 1, errorNode);
-                        }
-                      }
-                    })(),
-                  );
+            await Promise.all(
+              blocks.map(async ({ node, parent }) => {
+                const name = String(file.data?.slug ?? file.path ?? "unknown");
+                let children: RootContent[];
+                try {
+                  children = await runScript(node.value, `dataviewjs:${name}`, parseMarkdown, opts);
+                } catch (err) {
+                  console.error(`[DataviewJS] Error in file ${name}:`, err);
+                  children = [
+                    h("pre", { className: ["dataview", "dataview-error"] }, [
+                      { type: "text", value: `Evaluation Error: ${String(err)}` },
+                    ]),
+                  ];
                 }
-              },
+                // Same wrapper Obsidian puts around a rendered dataviewjs block.
+                const block = h("div", { className: ["block-language-dataviewjs"] }, children);
+                parent.children.splice(parent.children.indexOf(node), 1, block);
+              }),
             );
-
-            await Promise.all(promises);
           };
         },
       ];
+    },
+    externalResources() {
+      return { css: [{ content: styles, inline: true }] };
     },
   };
 };

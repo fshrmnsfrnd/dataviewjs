@@ -1,4 +1,5 @@
 import { createRequire } from 'module';
+import vm from 'vm';
 
 const require$1 = createRequire(import.meta.url);
 var __create = Object.create;
@@ -178,16 +179,49 @@ var empty = [];
 var CONTINUE = true;
 var EXIT = false;
 var SKIP = "skip";
-function visitParents(tree, test, visitor, reverse) {
+function visitParents(tree, testOrEnterOrVisitors, enterOrVisitorsOrReverse, reverse) {
+  if (!tree || typeof tree !== "object") {
+    throw new Error("Unexpected value `" + tree + "` for `tree`, expected node");
+  }
+  let preorder = true;
   let check;
-  if (typeof test === "function" && typeof visitor !== "function") {
-    reverse = visitor;
-    visitor = test;
+  let visitors;
+  let enter;
+  let exit;
+  if (typeof enterOrVisitorsOrReverse === "function" || enterOrVisitorsOrReverse && typeof enterOrVisitorsOrReverse === "object") {
+    check = /** @type {Test} */
+    testOrEnterOrVisitors;
+    visitors = enterOrVisitorsOrReverse;
+    if (reverse) preorder = false;
   } else {
-    check = test;
+    visitors = /** @type {Visitors | Visitor} */
+    testOrEnterOrVisitors;
+    if (enterOrVisitorsOrReverse) preorder = false;
+  }
+  if (typeof visitors === "function") {
+    enter = visitors;
+  } else if (visitors && typeof visitors === "object") {
+    if (visitors.enter === null || visitors.enter === void 0) ; else if (typeof visitors.enter === "function") {
+      enter = visitors.enter;
+    } else {
+      throw new Error(
+        "Unexpected value `" + visitors.enter + "` for `visitors.enter`, expected optional visitor"
+      );
+    }
+    if (typeof visitors.exit === "function") {
+      exit = visitors.exit;
+    } else {
+      throw new Error(
+        "Unexpected value `" + visitors.exit + "` for `visitors.exit`, expected visitor (pass a visitor directly if you only want an enter visitor)"
+      );
+    }
+  } else {
+    throw new Error(
+      "Unexpected value `" + visitors + "` for `enter` or `visitors`, expected visitor or object with visitors"
+    );
   }
   const is4 = convert(check);
-  const step = reverse ? -1 : 1;
+  const step = preorder ? 1 : -1;
   factory(tree, void 0, [])();
   function factory(node, index, parents) {
     const value = (
@@ -208,12 +242,10 @@ function visitParents(tree, test, visitor, reverse) {
     }
     return visit2;
     function visit2() {
+      const matches2 = !check || is4(node, index, parents[parents.length - 1] || void 0);
       let result = empty;
-      let subresult;
-      let offset;
-      let grandparents;
-      if (!test || is4(node, index, parents[parents.length - 1] || void 0)) {
-        result = toResult(visitor(node, parents));
+      if (enter && matches2) {
+        result = toResult(enter(node, parents, index));
         if (result[0] === EXIT) {
           return result;
         }
@@ -224,16 +256,27 @@ function visitParents(tree, test, visitor, reverse) {
           node
         );
         if (nodeAsParent.children && result[0] !== SKIP) {
-          offset = (reverse ? nodeAsParent.children.length : -1) + step;
-          grandparents = parents.concat(nodeAsParent);
+          let offset = (preorder ? -1 : nodeAsParent.children.length) + step;
+          const grandparents = [...parents, nodeAsParent];
           while (offset > -1 && offset < nodeAsParent.children.length) {
             const child = nodeAsParent.children[offset];
-            subresult = factory(child, offset, grandparents)();
+            const subresult = factory(child, offset, grandparents)();
             if (subresult[0] === EXIT) {
               return subresult;
             }
             offset = typeof subresult[1] === "number" ? subresult[1] : offset + step;
           }
+        }
+      }
+      if (exit && matches2) {
+        const exitResult = toResult(exit(node, parents, index));
+        if (exitResult[0] === SKIP) {
+          throw new Error(
+            "Unexpected value `" + exitResult[0] + "` from `exit`, expected `CONTINUE`, `EXIT`, index, or nothing"
+          );
+        }
+        if (exitResult[0] === EXIT || typeof exitResult[1] === "number") {
+          return exitResult;
         }
       }
       return result;
@@ -12156,10 +12199,10 @@ function expandBorderRadius(values) {
   const vExpanded = expandFourSides(vValues);
   const result = {};
   for (let i = 0; i < 4; i++) {
-    const h = hExpanded[i];
+    const h2 = hExpanded[i];
     const v = vExpanded[i];
-    result[BORDER_RADIUS_PHYSICAL[i]] = serialize(h) === serialize(v) ? h : [
-      ...h,
+    result[BORDER_RADIUS_PHYSICAL[i]] = serialize(h2) === serialize(v) ? h2 : [
+      ...h2,
       {
         type: "whitespace",
         value: " "
@@ -19823,89 +19866,303 @@ function Document4() {
 }
 setPrototypeOf(Document4, Document2).prototype = Document2.prototype;
 
+// src/dv.ts
+function h(tag, properties, children) {
+  return {
+    type: "dataviewjs",
+    data: properties ? { hName: tag, hProperties: properties } : { hName: tag },
+    children
+  };
+}
+var classNames2 = (cls) => cls ? cls.split(/\s+/) : [];
+var SUPPORTED = "dv.el, dv.header, dv.paragraph, dv.span, dv.list and dv.table";
+function createDv(parseMarkdown, output) {
+  const renderValue = (value) => {
+    if (value === null || value === void 0) return [{ type: "text", value: "-" }];
+    if (typeof value === "string") return parseMarkdown(value);
+    if (Array.isArray(value)) {
+      return [
+        h(
+          "ul",
+          { className: ["dataview", "dataview-ul", "dataview-result-list-ul"] },
+          value.map(
+            (item) => h("li", { className: ["dataview-result-list-li"] }, renderValue(item))
+          )
+        )
+      ];
+    }
+    if (Object.prototype.toString.call(value) === "[object Object]") {
+      return [{ type: "text", value: JSON.stringify(value) }];
+    }
+    return [{ type: "text", value: String(value) }];
+  };
+  const span = (value) => h("span", void 0, renderValue(value));
+  const el = (tag, value, options = {}) => {
+    const properties = { ...options.attr ?? {} };
+    const cls = classNames2(options.cls);
+    if (cls.length > 0) properties.className = cls;
+    const hasProperties = Object.keys(properties).length > 0;
+    output.push(h(tag, hasProperties ? properties : void 0, [span(value)]));
+  };
+  const api = {
+    el,
+    header: (level, text, options) => {
+      const depth = Math.min(Math.max(Math.trunc(Number(level)) || 1, 1), 6);
+      el(`h${depth}`, text, options);
+    },
+    paragraph: (text, options) => el("p", text, options),
+    span: (text, options) => el("span", text, options),
+    list: (values) => {
+      output.push(
+        h(
+          "ul",
+          { className: ["dataview", "list-view-ul"] },
+          Array.from(values ?? []).map((value) => h("li", void 0, [span(value)]))
+        )
+      );
+    },
+    table: (headers, rows) => {
+      const body = Array.from(rows ?? []).map((row) => Array.from(row));
+      const headerCells = Array.from(headers).map((header, i) => {
+        const cell = [span(header)];
+        if (i === 0) {
+          cell.push(
+            h("span", { className: ["dataview", "small-text"] }, [
+              { type: "text", value: String(body.length) }
+            ])
+          );
+        }
+        return h("th", { className: ["table-view-th"] }, cell);
+      });
+      output.push(
+        h("table", { className: ["dataview", "table-view-table"] }, [
+          h("thead", { className: ["table-view-thead"] }, [
+            h("tr", { className: ["table-view-tr-header"] }, headerCells)
+          ]),
+          h(
+            "tbody",
+            { className: ["table-view-tbody"] },
+            body.map(
+              (row) => h(
+                "tr",
+                void 0,
+                row.map((value) => h("td", void 0, [span(value)]))
+              )
+            )
+          )
+        ])
+      );
+    }
+  };
+  return new Proxy(api, {
+    get(target, key2, receiver) {
+      if (typeof key2 === "symbol" || key2 in target || key2 === "then") {
+        return Reflect.get(target, key2, receiver);
+      }
+      return () => {
+        throw new Error(
+          `dv.${key2} is not supported when rendering DataviewJS in Quartz (supported: ${SUPPORTED})`
+        );
+      };
+    }
+  });
+}
+
+// src/obsidian.ts
+function createRequestUrl(timeoutMs) {
+  return async function requestUrl(request) {
+    const param = typeof request === "string" ? { url: request } : request;
+    const headers = { ...param.headers ?? {} };
+    if (param.contentType) headers["Content-Type"] = param.contentType;
+    const res = await fetch(param.url, {
+      method: param.method ?? "GET",
+      headers,
+      body: param.body,
+      signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : void 0
+    });
+    const arrayBuffer = await res.arrayBuffer();
+    if (res.status >= 400 && param.throw !== false) {
+      throw Object.assign(new Error(`Request failed, status ${res.status}`), {
+        status: res.status
+      });
+    }
+    const text = new TextDecoder().decode(arrayBuffer);
+    return {
+      status: res.status,
+      headers: Object.fromEntries(res.headers.entries()),
+      arrayBuffer,
+      text,
+      get json() {
+        return JSON.parse(text);
+      }
+    };
+  };
+}
+function createObsidianModule(timeoutMs) {
+  const requestUrl = createRequestUrl(timeoutMs);
+  return {
+    requestUrl,
+    request: async (request) => (await requestUrl(request)).text
+  };
+}
+var OBSIDIAN_GLOBALS_SOURCE = `
+(() => {
+  const def = (target, name, value) => {
+    if (name in target) return;
+    Object.defineProperty(target, name, { value, writable: true, configurable: true });
+  };
+  def(String.prototype, "contains", function (target) { return this.includes(target); });
+  def(String.prototype, "format", function (...args) {
+    return this.replace(/{(\\d+)}/g, (match, i) => (args[i] !== undefined ? String(args[i]) : match));
+  });
+  def(Array.prototype, "contains", function (target) { return this.includes(target); });
+  def(Array.prototype, "first", function () { return this[0]; });
+  def(Array.prototype, "last", function () { return this[this.length - 1]; });
+  def(Array.prototype, "remove", function (target) {
+    for (let i = this.length - 1; i >= 0; i--) if (this[i] === target) this.splice(i, 1);
+  });
+  def(Array.prototype, "unique", function () { return Array.from(new Set(this)); });
+  def(Math, "clamp", (value, min, max) => Math.min(Math.max(value, min), max));
+  def(Math, "square", (value) => value * value);
+  def(String, "isString", (value) => typeof value === "string");
+  def(Number, "isNumber", (value) => typeof value === "number");
+  def(Object, "isEmpty", (object) => {
+    for (const key in object) if (Object.prototype.hasOwnProperty.call(object, key)) return false;
+    return true;
+  });
+})();
+`;
+
+// src/styles.ts
+var styles = `
+.block-language-dataviewjs .dataview.small-text {
+  font-size: smaller;
+  color: var(--gray);
+  margin-left: 3px;
+}
+.block-language-dataviewjs .dataview.small-text::before {
+  content: "(";
+}
+.block-language-dataviewjs .dataview.small-text::after {
+  content: ")";
+}
+.block-language-dataviewjs .dataview.list-view-ul {
+  margin-block: 0.2em;
+}
+.block-language-dataviewjs pre.dataview.dataview-error {
+  white-space: pre-wrap;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--lightgray);
+  border-radius: 5px;
+  color: var(--darkgray);
+}
+`;
+
 // src/index.ts
-var DataviewJS = (_opts) => {
+var defaultOptions2 = {
+  requestTimeout: 15e3
+};
+var nodeRequire = createRequire(import.meta.url);
+var DOMParser2 = class {
+  parseFromString(markup, mimeType) {
+    const wrapped = mimeType === "text/html" && !/<html[\s>]/i.test(markup) ? `<!DOCTYPE html><html><head></head><body>${markup}</body></html>` : markup;
+    return new DOMParser().parseFromString(wrapped, mimeType);
+  }
+};
+var stripPositions = (node) => {
+  delete node.position;
+  for (const child of node.children ?? []) stripPositions(child);
+};
+function createMarkdownParser(processor) {
+  return (text) => {
+    if (text === "") return [];
+    try {
+      if (!processor) throw new Error("no processor");
+      const root = processor.parse(text);
+      stripPositions(root);
+      const only = root.children.length === 1 ? root.children[0] : void 0;
+      return only?.type === "paragraph" ? only.children : root.children;
+    } catch {
+      return [{ type: "text", value: text }];
+    }
+  };
+}
+async function runScript(source, filename, parseMarkdown, opts) {
+  const output = [];
+  const dv = createDv(parseMarkdown, output);
+  const obsidian = createObsidianModule(opts.requestTimeout);
+  const context = vm.createContext({
+    dv,
+    dataview: dv,
+    require: (id) => id === "obsidian" ? obsidian : nodeRequire(id),
+    DOMParser: DOMParser2,
+    console,
+    fetch,
+    Headers,
+    Request,
+    Response,
+    URL,
+    URLSearchParams,
+    AbortController,
+    AbortSignal,
+    TextDecoder,
+    TextEncoder,
+    structuredClone,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    atob,
+    btoa
+  });
+  vm.runInContext(OBSIDIAN_GLOBALS_SOURCE, context);
+  await vm.runInContext(`(async () => {
+${source}
+})()`, context, {
+    filename,
+    lineOffset: -1
+  });
+  return output;
+}
+var DataviewJS = (userOpts) => {
+  const opts = { ...defaultOptions2, ...userOpts };
   return {
     name: "DataviewJS",
     markdownPlugins() {
       return [
-        () => {
+        function() {
+          const parseMarkdown = createMarkdownParser(
+            typeof this?.parse === "function" ? this : void 0
+          );
           return async (tree, file) => {
-            const promises = [];
-            visit(
-              tree,
-              "code",
-              (node, index, parent) => {
-                if (node.lang === "dataviewjs") {
-                  promises.push(
-                    (async () => {
-                      try {
-                        const generatedNodes = [];
-                        const dv = {
-                          header: (level, text) => {
-                            const depth = Math.min(Math.max(level, 1), 6);
-                            generatedNodes.push({
-                              type: "heading",
-                              depth,
-                              children: [{ type: "text", value: String(text) }]
-                            });
-                          },
-                          paragraph: (text) => {
-                            generatedNodes.push({
-                              type: "paragraph",
-                              children: [{ type: "text", value: String(text) }]
-                            });
-                          }
-                        };
-                        const mockRequire = (id) => {
-                          if (id === "obsidian") {
-                            return {
-                              // 3. args strikt typisiert für Obsidian's requestUrl (ohne any)
-                              requestUrl: async (args) => {
-                                const url = typeof args === "string" ? args : args.url;
-                                const fetchOpts = typeof args === "string" ? void 0 : args;
-                                const res = await fetch(url, fetchOpts);
-                                const text = await res.text();
-                                return { text, status: res.status };
-                              }
-                            };
-                          }
-                          return __require(id);
-                        };
-                        const AsyncFunction = Object.getPrototypeOf(
-                          async function() {
-                          }
-                        ).constructor;
-                        const executor = new AsyncFunction(
-                          "dv",
-                          "require",
-                          "DOMParser",
-                          node.value
-                        );
-                        await executor(dv, mockRequire, DOMParser);
-                        if (parent && index !== void 0) {
-                          parent.children.splice(index, 1, ...generatedNodes);
-                        }
-                      } catch (err) {
-                        const slug = file.data?.slug ?? "unknown";
-                        console.error(`[DataviewJS] Error in file ${String(slug)}:`, err);
-                        if (parent && index !== void 0) {
-                          const errorNode = {
-                            type: "html",
-                            value: `<div class="dataviewjs-error" style="color: red; border: 1px solid red; padding: 10px;">DataviewJS Render Error: ${String(err)}</div>`
-                          };
-                          parent.children.splice(index, 1, errorNode);
-                        }
-                      }
-                    })()
-                  );
+            const blocks = [];
+            visit(tree, "code", (node, _index, parent) => {
+              if (node.lang === "dataviewjs" && parent) blocks.push({ node, parent });
+            });
+            await Promise.all(
+              blocks.map(async ({ node, parent }) => {
+                const name = String(file.data?.slug ?? file.path ?? "unknown");
+                let children;
+                try {
+                  children = await runScript(node.value, `dataviewjs:${name}`, parseMarkdown, opts);
+                } catch (err) {
+                  console.error(`[DataviewJS] Error in file ${name}:`, err);
+                  children = [
+                    h("pre", { className: ["dataview", "dataview-error"] }, [
+                      { type: "text", value: `Evaluation Error: ${String(err)}` }
+                    ])
+                  ];
                 }
-              }
+                const block = h("div", { className: ["block-language-dataviewjs"] }, children);
+                parent.children.splice(parent.children.indexOf(node), 1, block);
+              })
             );
-            await Promise.all(promises);
           };
         }
       ];
+    },
+    externalResources() {
+      return { css: [{ content: styles, inline: true }] };
     }
   };
 };
