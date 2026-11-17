@@ -1,6 +1,6 @@
 {
   "name": "@quartz-community/dataviewjs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Render DataviewJS code blocks in Quartz.",
   "type": "module",
   "license": "MIT",
