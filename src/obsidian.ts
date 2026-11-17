@@ -20,6 +20,48 @@ export interface RequestUrlResponse {
   json: unknown;
 }
 
+const warn = (message: string): void => console.warn(`[DataviewJS] ${message}`);
+
+/**
+ * Chromium, and with it Obsidian, opens at most 6 connections per host and
+ * queues further requests. Node's fetch has no such limit, so a script that
+ * fires 18 requests at one site with Promise.all works in Obsidian but trips
+ * the site's connection limits in the build. Shared by all blocks of a build.
+ */
+export const MAX_CONNECTIONS_PER_HOST = 6;
+const hostSlots = new Map<string, { active: number; queue: (() => void)[] }>();
+
+async function withHostSlot<T>(url: string, task: () => Promise<T>): Promise<T> {
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    return task();
+  }
+  let slot = hostSlots.get(host);
+  if (!slot) {
+    slot = { active: 0, queue: [] };
+    hostSlots.set(host, slot);
+  }
+  const current = slot;
+  if (current.active >= MAX_CONNECTIONS_PER_HOST) {
+    await new Promise<void>((resolve) => current.queue.push(resolve));
+  } else {
+    current.active++;
+  }
+  try {
+    return await task();
+  } finally {
+    const next = current.queue.shift();
+    if (next) {
+      next(); // hand the slot over directly
+    } else {
+      current.active--;
+      if (current.active === 0) hostSlots.delete(host);
+    }
+  }
+}
+
 /**
  * Mirrors `requestUrl` from the Obsidian API: resolves with the body in
  * several shapes and, like Obsidian, rejects on HTTP status >= 400 unless
@@ -31,18 +73,38 @@ export function createRequestUrl(timeoutMs: number) {
     const headers: Record<string, string> = { ...(param.headers ?? {}) };
     if (param.contentType) headers["Content-Type"] = param.contentType;
 
-    const res = await fetch(param.url, {
-      method: param.method ?? "GET",
-      headers,
-      body: param.body,
-      signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
-    });
-    const arrayBuffer = await res.arrayBuffer();
-
-    if (res.status >= 400 && param.throw !== false) {
-      throw Object.assign(new Error(`Request failed, status ${res.status}`), {
-        status: res.status,
+    let res: Response;
+    let arrayBuffer: ArrayBuffer;
+    try {
+      [res, arrayBuffer] = await withHostSlot(param.url, async () => {
+        // The timeout starts once a slot is free, so queueing does not eat it up.
+        const response = await fetch(param.url, {
+          method: param.method ?? "GET",
+          headers,
+          body: param.body,
+          signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
+        });
+        return [response, await response.arrayBuffer()] as const;
       });
+    } catch (err) {
+      const cause = (err as { cause?: { code?: string } }).cause?.code;
+      warn(`requestUrl ${param.url} failed: ${String(err)}${cause ? ` (${cause})` : ""}`);
+      throw err;
+    }
+
+    if (res.status >= 400) {
+      // Scripts usually swallow errors with try/catch, so without this the
+      // build log would not say why a block rendered without data.
+      const challenge = res.headers.get("cf-mitigated") === "challenge";
+      warn(
+        `requestUrl ${param.url} answered HTTP ${res.status}` +
+          (challenge ? " (Cloudflare bot challenge: the site blocks non-browser clients)" : ""),
+      );
+      if (param.throw !== false) {
+        throw Object.assign(new Error(`Request failed, status ${res.status}`), {
+          status: res.status,
+        });
+      }
     }
 
     const text = new TextDecoder().decode(arrayBuffer);

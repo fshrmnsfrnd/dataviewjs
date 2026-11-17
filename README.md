@@ -40,7 +40,9 @@ dv.paragraph(`**${res.json.value}** items`);
   including the `{ cls, attr }` options. Strings are rendered as markdown, like in Obsidian.
 - **`require("obsidian")`**: `requestUrl` and `request`. As in Obsidian, `requestUrl` rejects on
   HTTP status >= 400 unless `throw: false` is passed, and the response has `status`, `headers`,
-  `text`, `json` and `arrayBuffer`.
+  `text`, `json` and `arrayBuffer`. Like Chromium (and so Obsidian), at most 6 requests per host
+  run at the same time; further ones wait. Failed requests are logged as
+  `[DataviewJS] requestUrl … answered HTTP 403` even when the script catches the error.
 - **`DOMParser`** (via linkedom), `fetch`, `URL`, timers and `console`.
 - **Obsidian's prototype extensions** such as `"text".contains("x")`, `[1, 2].first()`,
   `[1, 2].last()`, `Math.clamp()`. They only exist inside the script, not in the Quartz build.
@@ -57,7 +59,8 @@ contents, just as they are not part of the outline in Obsidian. A failing block 
 - Scripts run **once, at build time**. "Live" data is a snapshot from the last build; rebuild on a
   schedule if it should stay fresh.
 - Requests are made by Node, not by a Chromium browser as in Obsidian. Sites behind bot protection
-  may answer `403` to the build even though the same request works in Obsidian.
+  (e.g. a Cloudflare challenge) answer `403` to the build even though the same request works in
+  Obsidian. The build log says so; use a source that serves plain HTTP clients instead.
 - Vault queries (`dv.pages()`, `dv.current()`, `dv.query()`, ...) and DOM access (`dv.container`,
   `app`, `window`, `document`) are not available. Calling an unsupported `dv` function renders an
   error that names it.

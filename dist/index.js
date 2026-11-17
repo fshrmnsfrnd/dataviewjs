@@ -19969,22 +19969,71 @@ function createDv(parseMarkdown, output) {
 }
 
 // src/obsidian.ts
+var warn = (message) => console.warn(`[DataviewJS] ${message}`);
+var MAX_CONNECTIONS_PER_HOST = 6;
+var hostSlots = /* @__PURE__ */ new Map();
+async function withHostSlot(url, task) {
+  let host;
+  try {
+    host = new URL(url).host;
+  } catch {
+    return task();
+  }
+  let slot = hostSlots.get(host);
+  if (!slot) {
+    slot = { active: 0, queue: [] };
+    hostSlots.set(host, slot);
+  }
+  const current = slot;
+  if (current.active >= MAX_CONNECTIONS_PER_HOST) {
+    await new Promise((resolve) => current.queue.push(resolve));
+  } else {
+    current.active++;
+  }
+  try {
+    return await task();
+  } finally {
+    const next = current.queue.shift();
+    if (next) {
+      next();
+    } else {
+      current.active--;
+      if (current.active === 0) hostSlots.delete(host);
+    }
+  }
+}
 function createRequestUrl(timeoutMs) {
   return async function requestUrl(request) {
     const param = typeof request === "string" ? { url: request } : request;
     const headers = { ...param.headers ?? {} };
     if (param.contentType) headers["Content-Type"] = param.contentType;
-    const res = await fetch(param.url, {
-      method: param.method ?? "GET",
-      headers,
-      body: param.body,
-      signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : void 0
-    });
-    const arrayBuffer = await res.arrayBuffer();
-    if (res.status >= 400 && param.throw !== false) {
-      throw Object.assign(new Error(`Request failed, status ${res.status}`), {
-        status: res.status
+    let res;
+    let arrayBuffer;
+    try {
+      [res, arrayBuffer] = await withHostSlot(param.url, async () => {
+        const response = await fetch(param.url, {
+          method: param.method ?? "GET",
+          headers,
+          body: param.body,
+          signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : void 0
+        });
+        return [response, await response.arrayBuffer()];
       });
+    } catch (err) {
+      const cause = err.cause?.code;
+      warn(`requestUrl ${param.url} failed: ${String(err)}${cause ? ` (${cause})` : ""}`);
+      throw err;
+    }
+    if (res.status >= 400) {
+      const challenge = res.headers.get("cf-mitigated") === "challenge";
+      warn(
+        `requestUrl ${param.url} answered HTTP ${res.status}` + (challenge ? " (Cloudflare bot challenge: the site blocks non-browser clients)" : "")
+      );
+      if (param.throw !== false) {
+        throw Object.assign(new Error(`Request failed, status ${res.status}`), {
+          status: res.status
+        });
+      }
     }
     const text = new TextDecoder().decode(arrayBuffer);
     return {

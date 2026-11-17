@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
 import { DataviewJS } from "../src/index";
+import { MAX_CONNECTIONS_PER_HOST } from "../src/obsidian";
 
 async function render(markdown: string, options = {}): Promise<string> {
   const plugins = DataviewJS(options).markdownPlugins?.({} as BuildCtx) as PluggableList;
@@ -103,7 +104,66 @@ describe("DataviewJS", () => {
     expect(html).toContain("dv.pages is not supported");
   });
 
+  it("limits parallel requests per host like Chromium does", async () => {
+    let active = 0;
+    let peak = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active--;
+        return new Response("page " + url.split("/").pop(), { status: 200 });
+      }),
+    );
+
+    const html = await render(
+      block(`
+const { requestUrl } = require("obsidian");
+const urls = Array.from({ length: 18 }, (_, i) => "https://one.test/" + i);
+const texts = await Promise.all(urls.map(async (url) => (await requestUrl({ url })).text));
+dv.paragraph(String(texts.length) + " " + texts[17]);
+`),
+    );
+
+    expect(html).toContain("<p><span>18 page 17</span></p>");
+    expect(peak).toBe(MAX_CONNECTIONS_PER_HOST);
+  });
+
+  it("logs failed requests even when the script catches them", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("Just a moment...", {
+            status: 403,
+            headers: { "cf-mitigated": "challenge" },
+          }),
+      ),
+    );
+
+    const html = await render(
+      block(`
+const { requestUrl } = require("obsidian");
+try { await requestUrl("https://blocked.test/"); } catch { dv.paragraph("caught"); }
+const res = await requestUrl({ url: "https://blocked.test/again", throw: false });
+dv.paragraph(String(res.status));
+`),
+    );
+
+    expect(html).toContain("<p><span>caught</span></p>");
+    expect(html).toContain("<p><span>403</span></p>");
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0]?.[0]).toBe(
+      "[DataviewJS] requestUrl https://blocked.test/ answered HTTP 403 " +
+        "(Cloudflare bot challenge: the site blocks non-browser clients)",
+    );
+  });
+
   it("runs a script that scrapes pages with requestUrl and DOMParser", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const pages: Record<string, string> = {
       "https://example.test/axams/":
         "<html><body><div>Offene Lifte <b>3</b> von 9</div><p>Berg: 120 cm</p><p>Tal 35 cm</p></body></html>",
